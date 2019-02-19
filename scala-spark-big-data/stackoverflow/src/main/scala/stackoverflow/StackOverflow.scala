@@ -1,7 +1,7 @@
 package stackoverflow
 
-import org.apache.spark.{SparkConf, SparkContext}
 import org.apache.spark.rdd.RDD
+import org.apache.spark.{SparkConf, SparkContext}
 
 import scala.annotation.tailrec
 
@@ -25,9 +25,9 @@ object StackOverflow extends StackOverflow {
     val vectors = vectorPostings(scored)
     assert(vectors.count() == 2121822, "Incorrect number of vectors: " + vectors.count())
 
-//    val means   = kmeans(sampleVectors(vectors), vectors, debug = true)
-//    val results = clusterResults(means, vectors)
-//    printResults(results)
+    val means   = kmeans(sampleVectors(vectors), vectors, debug = true)
+    val results = clusterResults(means, vectors)
+    printResults(results)
   }
 }
 
@@ -77,10 +77,9 @@ class StackOverflow extends Serializable {
   /** Group the questions and answers together */
   def groupedPostings(postings: RDD[Posting]): RDD[(QID, Iterable[(Question, Answer)])] = {
     val questions = postings.filter(_.postingType == 1).map(posting => (posting.id, posting))
-    val answers = postings.filter(_.postingType == 2).map(posting => (posting.parentId.get, posting))
-    val rdd = questions.leftOuterJoin(answers)
-    val result = rdd.groupByKey
-    result.mapValues(x => x.flatMap(y => if (y._2 != None) Array((y._1, y._2.get)) else None))
+    val answers = postings.filter(a => a.postingType == 2 && a.parentId.isDefined).map(posting => (posting.parentId.get, posting))
+    val rdd = questions.join(answers)
+    rdd.groupByKey
   }
 
 
@@ -99,12 +98,7 @@ class StackOverflow extends Serializable {
       highScore
     }
 
-    grouped.map(x => {
-      val answers = x._2.map(_._2).toArray
-      val highScore = answerHighScore(answers)
-      val question = x._2.head._1
-      (question, highScore)
-    })
+    grouped.flatMap(_._2).groupByKey.mapValues(iterable => answerHighScore(iterable.toArray))
   }
 
 
@@ -124,7 +118,7 @@ class StackOverflow extends Serializable {
       }
     }
 
-    scored.map(x => (firstLangInTag(x._1.tags, langs).getOrElse(0) * langSpread, x._2))
+    scored.map(x => (firstLangInTag(x._1.tags, langs).getOrElse(-1) * langSpread, x._2)).filter(_._1 >= 0).cache
   }
 
 
@@ -179,9 +173,16 @@ class StackOverflow extends Serializable {
 
   /** Main kmeans computation */
   @tailrec final def kmeans(means: Array[(Int, Int)], vectors: RDD[(Int, Int)], iter: Int = 1, debug: Boolean = false): Array[(Int, Int)] = {
-    val newMeans = means.clone() // you need to compute newMeans
+    val newMeans = means.clone
 
-    // TODO: Fill in the newMeans array
+    val clusters = vectors.map{
+      case point: (Int, Int) => (findClosest(point, means), point)
+    }.groupByKey.mapValues(averageVectors).collect
+
+    clusters.foreach{
+      case (index, newPoint) => newMeans(index) = newPoint
+    }
+
     val distance = euclideanDistance(means, newMeans)
 
     if (debug) {
@@ -282,10 +283,13 @@ class StackOverflow extends Serializable {
     val closestGrouped = closest.groupByKey()
 
     val median = closestGrouped.mapValues { vs =>
-      val langLabel: String   = ??? // most common language in the cluster
-      val langPercent: Double = ??? // percent of the questions in the most common language
-      val clusterSize: Int    = ???
-      val medianScore: Int    = ???
+      val grouped: Map[Int, Int] = vs.map(_._1 / langSpread).groupBy(identity).mapValues(_.size)
+      val maxLangIndex = grouped.maxBy(_._2)._1
+      val langLabel: String   = langs(maxLangIndex) // most common language in the cluster
+      val langPercent: Double = grouped(maxLangIndex) * 100.0 / vs.size // percent of the questions in the most common language
+      val clusterSize: Int    = vs.size
+      val sortedByHighScore = vs.toList.sortBy(_._2)
+      val medianScore: Int    = (sortedByHighScore((clusterSize - 1) / 2)._2 + sortedByHighScore(clusterSize / 2)._2) / 2
 
       (langLabel, langPercent, clusterSize, medianScore)
     }
@@ -301,3 +305,54 @@ class StackOverflow extends Serializable {
       println(f"${score}%7d  ${lang}%-17s (${percent}%-5.1f%%)      ${size}%7d")
   }
 }
+
+/*
+Resulting clusters:
+  Score  Dominant language (%percent)  Questions
+================================================
+      0  Groovy            (100.0%)         1631
+      0  MATLAB            (100.0%)         3725
+      1  C#                (100.0%)       361835
+      1  Ruby              (100.0%)        54727
+      1  CSS               (100.0%)       113598
+      1  PHP               (100.0%)       315771
+      1  Objective-C       (100.0%)        94745
+      1  JavaScript        (100.0%)       365649
+      1  Java              (100.0%)       383473
+      2  Perl              (100.0%)        19229
+      2  MATLAB            (100.0%)         7989
+      2  Clojure           (100.0%)         3441
+      2  Python            (100.0%)       174586
+      2  C++               (100.0%)       181255
+      2  Scala             (100.0%)        12423
+      3  Groovy            (100.0%)         1390
+      4  Haskell           (100.0%)        10362
+      5  MATLAB            (100.0%)         2774
+      9  Perl              (100.0%)         4716
+     14  Clojure           (100.0%)          595
+     25  Scala             (100.0%)          728
+     36  Groovy            (100.0%)           32
+     53  Haskell           (100.0%)          202
+     66  Clojure           (100.0%)           57
+     78  Perl              (100.0%)           56
+     79  C#                (100.0%)         2585
+     85  Ruby              (100.0%)          648
+     97  Objective-C       (100.0%)          784
+    130  Scala             (100.0%)           47
+    139  PHP               (100.0%)          475
+    172  CSS               (100.0%)          358
+    212  C++               (100.0%)          264
+    227  Python            (100.0%)          400
+    249  Java              (100.0%)          483
+    377  JavaScript        (100.0%)          431
+    443  C#                (100.0%)          147
+    503  Objective-C       (100.0%)           73
+    546  Ruby              (100.0%)           34
+    766  CSS               (100.0%)           26
+    887  PHP               (100.0%)           13
+   1130  Haskell           (100.0%)            2
+   1269  Python            (100.0%)           19
+   1290  C++               (100.0%)            9
+   1895  JavaScript        (100.0%)           33
+  10271  Java              (100.0%)            2
+ */
